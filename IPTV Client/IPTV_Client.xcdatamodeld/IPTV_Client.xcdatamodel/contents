@@ -1,9 +1,47 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <model type="com.apple.IDECoreDataModeler.DataModel" documentVersion="1.0" lastSavedToolsVersion="1" systemVersion="11A491" minimumToolsVersion="Automatic" sourceLanguage="Swift" usedWithCloudKit="false" userDefinedModelVersionIdentifier="">
-    <entity name="Item" representedClassName="Item" syncable="YES" codeGenerationType="class">
-        <attribute name="timestamp" optional="YES" attributeType="Date" usesScalarValueType="NO"/>
+    <entity name="Profile" representedClassName="ProfileEntity" syncable="YES" codeGenerationType="none">
+        <attribute name="id" optional="NO" attributeType="UUID" usesScalarValueType="NO"/>
+        <attribute name="name" optional="NO" attributeType="String"/>
+        <attribute name="providerType" optional="NO" attributeType="String" defaultValueString="xtream"/>
+        <attribute name="server" optional="NO" attributeType="String"/>
+        <attribute name="username" optional="NO" attributeType="String"/>
+        <attribute name="password" optional="NO" attributeType="String"/>
+        <attribute name="playlistURL" optional="YES" attributeType="String"/>
+        <attribute name="stalkerMAC" optional="YES" attributeType="String"/>
+        <attribute name="createdAt" optional="NO" attributeType="Date" usesScalarValueType="NO"/>
+    </entity>
+    <entity name="EPGConfig" representedClassName="EPGConfigEntity" syncable="YES" codeGenerationType="none">
+        <attribute name="id" optional="NO" attributeType="UUID" usesScalarValueType="NO"/>
+        <attribute name="profileID" optional="NO" attributeType="UUID" usesScalarValueType="NO"/>
+        <attribute name="isEnabled" optional="NO" attributeType="Boolean" defaultValueString="YES" usesScalarValueType="YES"/>
+        <attribute name="customURL" optional="YES" attributeType="String"/>
+        <attribute name="refreshFrequencyHours" optional="NO" attributeType="Integer 16" defaultValueString="1" usesScalarValueType="YES"/>
+        <attribute name="timeShiftHours" optional="NO" attributeType="Integer 16" defaultValueString="0" usesScalarValueType="YES"/>
+        <attribute name="lastRefreshAt" optional="YES" attributeType="Date" usesScalarValueType="NO"/>
+        <attribute name="lastRefreshStatus" optional="YES" attributeType="String"/>
+        <attribute name="lastXMLData" optional="YES" attributeType="Binary" allowsExternalBinaryDataStorage="YES"/>
+    </entity>
+    <entity name="Channel" representedClassName="ChannelEntity" syncable="YES" codeGenerationType="none">
+        <attribute name="id" optional="NO" attributeType="UUID" usesScalarValueType="NO"/>
+        <attribute name="profileID" optional="NO" attributeType="UUID" usesScalarValueType="NO"/>
+        <attribute name="streamID" optional="NO" attributeType="Integer 64" defaultValueString="0" usesScalarValueType="YES"/>
+        <attribute name="externalID" optional="YES" attributeType="String"/>
+        <attribute name="epgChannelID" optional="YES" attributeType="String"/>
+        <attribute name="contentType" optional="NO" attributeType="String" defaultValueString="live"/>
+        <attribute name="name" optional="NO" attributeType="String"/>
+        <attribute name="streamURL" optional="NO" attributeType="String"/>
+        <attribute name="logoURL" optional="YES" attributeType="String"/>
+        <attribute name="categoryName" optional="YES" attributeType="String"/>
+        <attribute name="language" optional="YES" attributeType="String"/>
+        <attribute name="isFavorite" optional="NO" attributeType="Boolean" defaultValueString="NO" usesScalarValueType="YES"/>
+        <attribute name="isDownloaded" optional="NO" attributeType="Boolean" defaultValueString="NO" usesScalarValueType="YES"/>
+        <attribute name="localFilePath" optional="YES" attributeType="String"/>
+        <attribute name="lastUpdatedAt" optional="NO" attributeType="Date" usesScalarValueType="NO"/>
     </entity>
     <elements>
-        <element name="Item" positionX="-63" positionY="-18" width="128" height="44"/>
+        <element name="Profile" positionX="-140" positionY="-20" width="128" height="104"/>
+        <element name="EPGConfig" positionX="70" positionY="-20" width="128" height="164"/>
+        <element name="Channel" positionX="300" positionY="-20" width="128" height="149"/>
     </elements>
 </model>

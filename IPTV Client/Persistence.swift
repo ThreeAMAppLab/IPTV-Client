@@ -14,10 +14,28 @@ struct PersistenceController {
     static let preview: PersistenceController = {
         let result = PersistenceController(inMemory: true)
         let viewContext = result.container.viewContext
-        for _ in 0..<10 {
-            let newItem = Item(context: viewContext)
-            newItem.timestamp = Date()
-        }
+        let demoProfile = ProfileEntity(context: viewContext)
+        demoProfile.id = UUID()
+        demoProfile.name = "Demo Profile"
+        demoProfile.providerType = "xtream"
+        demoProfile.server = "https://example.com"
+        demoProfile.username = "demo"
+        demoProfile.password = "password"
+        demoProfile.playlistURL = nil
+        demoProfile.stalkerMAC = nil
+        demoProfile.createdAt = Date()
+
+        let demoConfig = EPGConfigEntity(context: viewContext)
+        demoConfig.id = UUID()
+        demoConfig.profileID = demoProfile.id
+        demoConfig.isEnabled = true
+        demoConfig.customURL = nil
+        demoConfig.refreshFrequencyHours = 1
+        demoConfig.timeShiftHours = 0
+        demoConfig.lastRefreshAt = nil
+        demoConfig.lastRefreshStatus = "Not downloaded yet"
+        demoConfig.lastXMLData = nil
+
         do {
             try viewContext.save()
         } catch {
