@@ -8,9 +8,36 @@
 import AVFoundation
 import AVKit
 import CoreData
+import os
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
+
+private extension Color {
+    static var appBackground: Color {
+        #if os(tvOS)
+        Color.black
+        #else
+        Color(.systemBackground)
+        #endif
+    }
+
+    static var appSecondaryBackground: Color {
+        #if os(tvOS)
+        Color(white: 0.16)
+        #else
+        Color(.secondarySystemBackground)
+        #endif
+    }
+
+    static var appTertiaryBackground: Color {
+        #if os(tvOS)
+        Color(white: 0.22)
+        #else
+        Color(.tertiarySystemBackground)
+        #endif
+    }
+}
 
 struct ContentView: View {
     @Environment(\.managedObjectContext) private var viewContext
@@ -25,6 +52,7 @@ struct ContentView: View {
 
     @State private var showAddProfile = false
     @State private var profileToEdit: ProfileEntity?
+    @State private var profileToDelete: ProfileEntity?
     @State private var errorMessage: String?
 
     var body: some View {
@@ -50,7 +78,14 @@ struct ContentView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+                    #if !os(tvOS)
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        Button(role: .destructive) {
+                            profileToDelete = profile
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+
                         Button {
                             profileToEdit = profile
                         } label: {
@@ -58,11 +93,18 @@ struct ContentView: View {
                         }
                         .tint(.blue)
                     }
+                    #endif
                     .contextMenu {
                         Button {
                             profileToEdit = profile
                         } label: {
                             Label("Edit Profile", systemImage: "pencil")
+                        }
+
+                        Button(role: .destructive) {
+                            profileToDelete = profile
+                        } label: {
+                            Label("Delete Profile", systemImage: "trash")
                         }
                     }
                 }
@@ -70,12 +112,16 @@ struct ContentView: View {
             }
             .navigationTitle("Profiles")
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItemGroup(placement: .topBarLeading) {
                     Button {
                         forceDarkMode.toggle()
                     } label: {
                         Image(systemName: forceDarkMode ? "moon.fill" : "moon")
                     }
+
+                    #if !os(tvOS)
+                    EditButton()
+                    #endif
                 }
 
                 ToolbarItem(placement: .topBarTrailing) {
@@ -88,12 +134,31 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showAddProfile) {
-            AddProfileView()
+            AddProfileView(onSave: backUpProfile)
                 .environment(\.managedObjectContext, viewContext)
         }
         .sheet(item: $profileToEdit) { profile in
-            EditProfileView(profile: profile)
+            EditProfileView(profile: profile, onBackup: backUpProfile)
                 .environment(\.managedObjectContext, viewContext)
+        }
+        .confirmationDialog(
+            "Delete Profile?",
+            isPresented: Binding(
+                get: { profileToDelete != nil },
+                set: { if !$0 { profileToDelete = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: profileToDelete
+        ) { profile in
+            Button("Delete \(profile.name)", role: .destructive) {
+                deleteProfile(profile)
+                profileToDelete = nil
+            }
+            Button("Cancel", role: .cancel) {
+                profileToDelete = nil
+            }
+        } message: { profile in
+            Text("This removes \(profile.name), its saved channels, and its EPG data from this device.")
         }
         .preferredColorScheme(forceDarkMode ? .dark : nil)
         .alert(
@@ -107,6 +172,9 @@ struct ContentView: View {
         } message: {
             Text(errorMessage ?? "")
         }
+        .task {
+            await synchronizeProfilesWithCloud()
+        }
     }
 
     private func providerDisplayName(for profile: ProfileEntity) -> String {
@@ -115,10 +183,60 @@ struct ContentView: View {
 
     private func deleteProfiles(offsets: IndexSet) {
         let selectedProfiles = offsets.map { profiles[$0] }
+        let profileIDs = selectedProfiles.map(\.id)
         do {
             try IPTVDataStore.deleteProfiles(selectedProfiles, in: viewContext)
+            for profileID in profileIDs {
+                ContentBootstrapCache.shared.invalidate(profileID)
+            }
+            for profileID in profileIDs {
+                removeProfileFromBackup(profileID)
+            }
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    private func deleteProfile(_ profile: ProfileEntity) {
+        let profileID = profile.id
+        do {
+            try IPTVDataStore.deleteProfiles([profile], in: viewContext)
+            ContentBootstrapCache.shared.invalidate(profileID)
+            removeProfileFromBackup(profileID)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func synchronizeProfilesWithCloud() async {
+        do {
+            let localProfiles = try IPTVDataStore.profileSnapshots(in: viewContext)
+            let mergedProfiles = try await ProfileCloudBackup.shared.synchronize(localProfiles: localProfiles)
+            try IPTVDataStore.restoreMissingProfiles(from: mergedProfiles, in: viewContext)
+        } catch {
+            // Local Core Data remains usable when the user is offline or not
+            // signed into iCloud, but make the loss of backup protection clear.
+            errorMessage = "Profiles are available locally, but iCloud backup could not sync: \(error.localizedDescription)"
+        }
+    }
+
+    private func backUpProfile(_ profile: ProfileSnapshot) {
+        Task {
+            do {
+                try await ProfileCloudBackup.shared.upsert(profile)
+            } catch {
+                errorMessage = "The profile was saved locally, but its iCloud backup failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func removeProfileFromBackup(_ profileID: UUID) {
+        Task {
+            do {
+                try await ProfileCloudBackup.shared.remove(profileID: profileID)
+            } catch {
+                errorMessage = "The profile was deleted locally, but its iCloud backup could not be updated: \(error.localizedDescription)"
+            }
         }
     }
 }
@@ -127,6 +245,8 @@ private struct AddProfileView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.managedObjectContext) private var viewContext
 
+    var onSave: (ProfileSnapshot) -> Void = { _ in }
+
     @State private var providerType: ProfileProviderType = .xtream
     @State private var name = ""
     @State private var server = ""
@@ -134,6 +254,7 @@ private struct AddProfileView: View {
     @State private var password = ""
     @State private var playlistURL = ""
     @State private var stalkerMAC = ""
+    @State private var errorMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -188,6 +309,17 @@ private struct AddProfileView: View {
                 }
             }
         }
+        .alert(
+            "Could Not Save Profile",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(errorMessage ?? "")
+        }
     }
 
     private var canSave: Bool {
@@ -241,9 +373,11 @@ private struct AddProfileView: View {
 
         do {
             try viewContext.save()
+            onSave(ProfileSnapshot(profile: profile))
             dismiss()
         } catch {
             viewContext.rollback()
+            errorMessage = error.localizedDescription
         }
     }
 }
@@ -254,6 +388,11 @@ private struct EditProfileView: View {
 
     let profile: ProfileEntity
     var onSave: () -> Void = {}
+    var onBackup: (ProfileSnapshot) -> Void = { _ in }
+
+    @AppStorage("sync_content_live") private var syncLive = true
+    @AppStorage("sync_content_movies") private var syncMovies = false
+    @AppStorage("sync_content_series") private var syncSeries = false
 
     @State private var name: String
     @State private var server: String
@@ -261,15 +400,21 @@ private struct EditProfileView: View {
     @State private var password: String
     @State private var playlistURL: String
     @State private var stalkerMAC: String
+    @State private var epgEnabled = true
     @State private var errorMessage: String?
 
     private var providerType: ProfileProviderType {
         ProfileProviderType(rawValue: profile.providerType) ?? .xtream
     }
 
-    init(profile: ProfileEntity, onSave: @escaping () -> Void = {}) {
+    init(
+        profile: ProfileEntity,
+        onSave: @escaping () -> Void = {},
+        onBackup: @escaping (ProfileSnapshot) -> Void = { _ in }
+    ) {
         self.profile = profile
         self.onSave = onSave
+        self.onBackup = onBackup
         _name = State(initialValue: profile.name)
         _server = State(initialValue: profile.server)
         _username = State(initialValue: profile.username)
@@ -317,21 +462,37 @@ private struct EditProfileView: View {
                             .autocorrectionDisabled()
                     }
                 }
+
+                Section {
+                    Toggle("Live TV", isOn: $syncLive)
+                    Toggle("Movies", isOn: $syncMovies)
+                    Toggle("Series", isOn: $syncSeries)
+                    Toggle("EPG", isOn: $epgEnabled)
+                } header: {
+                    Text("Content to sync")
+                } footer: {
+                    Text("Only the enabled types are downloaded when content loads. Turning a type off keeps its existing content but skips re-downloading it.")
+                }
             }
             .navigationTitle("Edit Profile")
+            #if !os(tvOS)
             .navigationBarTitleDisplayMode(.inline)
+            #endif
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
                         dismiss()
                     }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
                         saveProfile()
                     }
                     .disabled(!canSave)
                 }
+            }
+            .task {
+                loadEPGEnabledState()
             }
         }
         .alert(
@@ -392,12 +553,23 @@ private struct EditProfileView: View {
         }
 
         do {
+            if let config = try? IPTVDataStore.fetchOrCreateEPGConfig(profileID: profile.id, in: viewContext) {
+                config.isEnabled = epgEnabled
+            }
             try viewContext.save()
+            ContentBootstrapCache.shared.invalidate(profile.id)
+            onBackup(ProfileSnapshot(profile: profile))
             onSave()
             dismiss()
         } catch {
             viewContext.rollback()
             errorMessage = error.localizedDescription
+        }
+    }
+
+    private func loadEPGEnabledState() {
+        if let config = try? IPTVDataStore.fetchOrCreateEPGConfig(profileID: profile.id, in: viewContext) {
+            epgEnabled = config.isEnabled
         }
     }
 }
@@ -468,7 +640,9 @@ private struct ProfileDetailView: View {
             }
         }
         .navigationTitle(profile.name)
+        #if !os(tvOS)
         .navigationBarTitleDisplayMode(.inline)
+        #endif
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button("Done") {
@@ -477,7 +651,15 @@ private struct ProfileDetailView: View {
             }
         }
         .sheet(isPresented: $showEditProfile) {
-            EditProfileView(profile: profile, onSave: onProfileUpdated)
+            EditProfileView(
+                profile: profile,
+                onSave: onProfileUpdated,
+                onBackup: { snapshot in
+                    Task {
+                        try? await ProfileCloudBackup.shared.upsert(snapshot)
+                    }
+                }
+            )
                 .environment(\.managedObjectContext, viewContext)
         }
     }
@@ -556,7 +738,9 @@ private struct EPGView: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
+                #if !os(tvOS)
                 .keyboardShortcut(.cancelAction)
+                #endif
                 .accessibilityLabel("Close EPG")
             }
             .padding(.horizontal, 24)
@@ -614,8 +798,21 @@ private struct EPGView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
+                    #if os(tvOS)
+                    Picker("Refresh frequency", selection: $refreshFrequencyHours) {
+                        ForEach(1...24, id: \.self) { hour in
+                            Text("\(hour)h").tag(hour)
+                        }
+                    }
+                    Picker("Time shift", selection: $timeShiftHours) {
+                        ForEach(-12...12, id: \.self) { hour in
+                            Text("\(hour)h").tag(hour)
+                        }
+                    }
+                    #else
                     Stepper("Refresh frequency: \(refreshFrequencyHours)h", value: $refreshFrequencyHours, in: 1...24)
                     Stepper("Time shift: \(timeShiftHours)h", value: $timeShiftHours, in: -12...12)
+                    #endif
                 }
 
                 Section("Custom URL") {
@@ -783,6 +980,78 @@ private struct EPGView: View {
     }
 }
 
+/// Remembers, per profile, whether a full content sync (Live/Movies/Series
+/// fetch + EPG download/index) has already run this app session. Navigating
+/// back to the profile list and reopening the same profile recreates
+/// ContentBrowserView from scratch, resetting its @State — this cache is what
+/// lets that reentry skip straight to loading the already-synced local data
+/// instead of repeating the full network sync. It intentionally does not
+/// persist across app launches; "Update content now" invalidates it.
+@MainActor
+private final class ContentBootstrapCache {
+    static let shared = ContentBootstrapCache()
+    private init() {}
+
+    private var bootstrappedProfileIDs: Set<UUID> = []
+    private var epgIndexByProfileID: [UUID: EPGIndex] = [:]
+    private var metadataByProfile: [UUID: [IPTVContentType: [ChannelFilterMetadata]]] = [:]
+
+    func hasBootstrapped(_ profileID: UUID) -> Bool {
+        bootstrappedProfileIDs.contains(profileID)
+    }
+
+    func markBootstrapped(_ profileID: UUID) {
+        bootstrappedProfileIDs.insert(profileID)
+    }
+
+    func setEPGIndex(_ epgIndex: EPGIndex?, for profileID: UUID) {
+        epgIndexByProfileID[profileID] = epgIndex
+    }
+
+    func cachedEPGIndex(for profileID: UUID) -> EPGIndex? {
+        epgIndexByProfileID[profileID]
+    }
+
+    // Per-content-type filter metadata, precomputed during the initial load so
+    // switching tabs later reuses it instead of rebuilding (which was the cause
+    // of the hang on first tab switch). Survives back/forth within a session
+    // because it lives on this singleton, not the recreated view state.
+    func metadata(for profileID: UUID, contentType: IPTVContentType) -> [ChannelFilterMetadata]? {
+        metadataByProfile[profileID]?[contentType]
+    }
+
+    func setMetadata(_ metadata: [ChannelFilterMetadata], for profileID: UUID, contentType: IPTVContentType) {
+        metadataByProfile[profileID, default: [:]][contentType] = metadata
+    }
+
+    func invalidate(_ profileID: UUID) {
+        bootstrappedProfileIDs.remove(profileID)
+        epgIndexByProfileID.removeValue(forKey: profileID)
+        metadataByProfile.removeValue(forKey: profileID)
+    }
+}
+
+/// Thread-safe holder for a 0...1 progress fraction, written from a background
+/// parsing task and read by a MainActor polling loop, avoiding the need to
+/// hop actors on every single progress update.
+private final class EPGProgressReporter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _fraction: Double = 0
+
+    var fraction: Double {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _fraction
+        }
+        set {
+            lock.lock()
+            _fraction = newValue
+            lock.unlock()
+        }
+    }
+}
+
 private struct ContentBrowserView: View {
     private enum BrowserSheet: String, Identifiable {
         case downloads
@@ -798,14 +1067,6 @@ private struct ContentBrowserView: View {
         case category
 
         var id: String { rawValue }
-    }
-
-    private struct ChannelFilterMetadata {
-        let searchName: String
-        let categoryName: String
-        let languageToken: String?
-        let countryTokens: Set<String>
-        let epgCandidateIDs: Set<String>
     }
 
     let profile: ProfileEntity
@@ -832,17 +1093,29 @@ private struct ContentBrowserView: View {
         RecentChannelsStore.decode(recentChannelsJSON)
     }
 
+    #if os(tvOS)
+    private enum TVFocusTarget: Hashable {
+        case tab(IPTVContentType)
+        case titleSearchField
+    }
+    @FocusState private var tvFocusTarget: TVFocusTarget?
+    #endif
+
     @State private var selectedContentType: IPTVContentType = .live
     @State private var channels: [ChannelEntity] = []
     @State private var filteredChannels: [ChannelEntity] = []
     @State private var filteredPlayables: [PlayableChannel] = []
-    @State private var visibleChannelLimit = 180
-    @State private var channelFilterMetadata: [NSManagedObjectID: ChannelFilterMetadata] = [:]
+    @State private var visibleChannelLimit = 60
+    @State private var channelMetadataCache: [ChannelFilterMetadata] = []
+    @State private var isFilteringChannels = false
+    @State private var channelFilterGeneration = 0
+    @State private var channelFilterTask: Task<Void, Never>?
     @State private var activeDownloadIDs: Set<NSManagedObjectID> = []
 
     @State private var isInitialLoading = true
     @State private var didBootstrap = false
     @State private var loadingMessage = "Preparing IPTV..."
+    @State private var loadingProgress: Double = 0
 
     @State private var showMenu = false
     @State private var showFilters = true
@@ -872,8 +1145,16 @@ private struct ContentBrowserView: View {
     private let allCountriesToken = "__all__"
     private let allLanguageToken = "__all_language__"
     private let allCategoryToken = "__all_category__"
+    // The tvOS focus engine degrades sharply with a large number of
+    // simultaneously-focusable cells, so keep the rendered window smaller there
+    // and paginate more often. (iOS/macOS handle the bigger window fine.)
+    #if os(tvOS)
+    private let initialVisibleChannelLimit = 60
+    private let visibleChannelIncrement = 60
+    #else
     private let initialVisibleChannelLimit = 180
     private let visibleChannelIncrement = 180
+    #endif
 
     private var usesDesktopLayout: Bool {
         #if targetEnvironment(macCatalyst)
@@ -925,12 +1206,14 @@ private struct ContentBrowserView: View {
             }
 
             if isInitialLoading {
-                FunnyLoadingOverlay(message: loadingMessage)
+                FunnyLoadingOverlay(message: loadingMessage, progress: loadingProgress)
                     .transition(.opacity)
             }
         }
         .navigationTitle(selectedContentType.displayName)
+        #if !os(tvOS)
         .navigationBarTitleDisplayMode(.inline)
+        #endif
         .navigationBarBackButtonHidden(true)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
@@ -1005,6 +1288,7 @@ private struct ContentBrowserView: View {
             titleSearchDebounceTask?.cancel()
             epgSearchDebounceTask?.cancel()
             filterRefreshTask?.cancel()
+            channelFilterTask?.cancel()
         }
         .safeAreaInset(edge: .bottom) {
             if !usesWideLayout {
@@ -1049,6 +1333,14 @@ private struct ContentBrowserView: View {
         }
         .disabled(isInitialLoading)
         .blur(radius: isInitialLoading ? 3 : 0)
+        #if os(tvOS)
+        // Scrolling through a long channel grid can leave the bottom tab bar
+        // unreachable via focus navigation alone, so Menu jumps focus there
+        // directly instead of the default "pop the whole screen" behavior.
+        .onExitCommand {
+            tvFocusTarget = .tab(selectedContentType)
+        }
+        #endif
     }
 
     private var wideBrowserLayout: some View {
@@ -1080,16 +1372,52 @@ private struct ContentBrowserView: View {
 
     @ViewBuilder
     private var channelGridSection: some View {
-        if filteredChannels.isEmpty && !isInitialLoading {
+        if filteredChannels.isEmpty && isFilteringChannels {
+            HStack(spacing: 10) {
+                ProgressView()
+                Text("Filtering channels…")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.top, 30)
+            .frame(maxWidth: .infinity, alignment: .center)
+        } else if filteredChannels.isEmpty && !isInitialLoading {
             Text("No \(selectedContentType.displayName.lowercased()) found.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .padding(.top, 30)
                 .frame(maxWidth: .infinity, alignment: .center)
         } else {
+            if isFilteringChannels {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Updating results…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.bottom, 4)
+            }
+
+            let visible = visibleFilteredChannels
             LazyVGrid(columns: gridColumns, spacing: 14) {
-                ForEach(visibleFilteredChannels) { channel in
+                // Identify by the stable, never-nil Core Data objectID rather
+                // than ChannelEntity's Identifiable `id` (a non-optional UUID).
+                // Stale rows from older builds can have a nil stored id, and
+                // force-bridging that nil for identity crashes as soon as a
+                // search filters such a row into view.
+                ForEach(Array(visible.enumerated()), id: \.element.objectID) { index, channel in
                     channelCell(for: channel)
+                        // Load the next page as focus/scroll nears the end of
+                        // the current batch. Triggering from the trailing cells
+                        // (rather than a spinner placed below a lazy grid) is
+                        // reliable on tvOS, where scrolling is focus-driven.
+                        .onAppear {
+                            if index >= visible.count - gridColumnCount {
+                                increaseVisibleChannelLimitIfNeeded()
+                            }
+                        }
                 }
             }
 
@@ -1097,18 +1425,24 @@ private struct ContentBrowserView: View {
                 HStack {
                     Spacer()
                     ProgressView()
-                        .onAppear {
-                            increaseVisibleChannelLimitIfNeeded()
-                        }
                     Spacer()
                 }
                 .padding(.vertical, 18)
+                .onAppear {
+                    increaseVisibleChannelLimitIfNeeded()
+                }
             }
         }
     }
 
-    private var visibleFilteredChannels: ArraySlice<ChannelEntity> {
-        filteredChannels.prefix(visibleChannelLimit)
+    private var visibleFilteredChannels: [ChannelEntity] {
+        Array(filteredChannels.prefix(visibleChannelLimit))
+    }
+
+    /// Rough number of columns, used to start paginating a row early.
+    private var gridColumnCount: Int {
+        if usesWideLayout { return 6 }
+        return horizontalSizeClass == .compact ? 3 : 5
     }
 
     private var desktopContentTabs: some View {
@@ -1122,7 +1456,7 @@ private struct ContentBrowserView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
                         .background(
-                            selectedContentType == type ? Color.accentColor.opacity(0.15) : Color(.secondarySystemBackground),
+                            selectedContentType == type ? Color.accentColor.opacity(0.15) : Color.appSecondaryBackground,
                             in: RoundedRectangle(cornerRadius: 10, style: .continuous)
                         )
                         .foregroundStyle(selectedContentType == type ? Color.accentColor : Color.primary)
@@ -1172,12 +1506,14 @@ private struct ContentBrowserView: View {
                 }
             }
 
+            #if !os(tvOS)
             Button {
                 UIPasteboard.general.string = channel.streamURL
                 infoMessage = "Stream URL copied"
             } label: {
                 Label("Copy Stream URL", systemImage: "doc.on.doc")
             }
+            #endif
         }
     }
 
@@ -1210,6 +1546,9 @@ private struct ContentBrowserView: View {
                 TextField(titlePrompt, text: $titleQuery)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+                    #if os(tvOS)
+                    .focused($tvFocusTarget, equals: .titleSearchField)
+                    #endif
 
                 if !titleQuery.isEmpty {
                     Button {
@@ -1222,7 +1561,7 @@ private struct ContentBrowserView: View {
                 }
             }
             .padding(10)
-            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .background(Color.appSecondaryBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             if selectedContentType == .live {
                 HStack(spacing: 8) {
@@ -1244,7 +1583,7 @@ private struct ContentBrowserView: View {
                     }
                 }
                 .padding(10)
-                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .background(Color.appSecondaryBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
 
                 countryFilterControl
                 favoriteCountriesOnlyControl
@@ -1267,13 +1606,13 @@ private struct ContentBrowserView: View {
                 .font(.caption.weight(.semibold))
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
-                .background(Color(.secondarySystemBackground), in: Capsule())
+                .background(Color.appSecondaryBackground, in: Capsule())
             }
 
             recentlyWatchedSection
         }
         .padding(12)
-        .background(Color(.systemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(Color.appBackground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(Color.black.opacity(0.06), lineWidth: 1)
@@ -1360,7 +1699,7 @@ private struct ContentBrowserView: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
-            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .background(Color.appSecondaryBackground, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
         .buttonStyle(.plain)
         .disabled(favoriteCountriesInCurrentContext.isEmpty)
@@ -1594,7 +1933,7 @@ private struct ContentBrowserView: View {
                     .foregroundStyle(Color.accentColor)
             }
             .padding(12)
-            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .background(Color.appSecondaryBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
         .buttonStyle(.plain)
     }
@@ -1625,7 +1964,7 @@ private struct ContentBrowserView: View {
                             .padding(.horizontal, 10)
                             .padding(.vertical, 7)
                             .background(
-                                selected ? Color.accentColor.opacity(0.18) : Color(.secondarySystemBackground),
+                                selected ? Color.accentColor.opacity(0.18) : Color.appSecondaryBackground,
                                 in: Capsule()
                             )
                             .foregroundStyle(selected ? Color.accentColor : Color.primary)
@@ -1645,7 +1984,7 @@ private struct ContentBrowserView: View {
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
                 .background(
-                    isOn.wrappedValue ? Color.accentColor.opacity(0.18) : Color(.secondarySystemBackground),
+                    isOn.wrappedValue ? Color.accentColor.opacity(0.18) : Color.appSecondaryBackground,
                     in: Capsule()
                 )
                 .foregroundStyle(isOn.wrappedValue ? Color.accentColor : Color.primary)
@@ -1660,6 +1999,11 @@ private struct ContentBrowserView: View {
                 ForEach(IPTVContentType.allCases) { type in
                     Button {
                         selectedContentType = type
+                        #if os(tvOS)
+                        // Only pressing a tab (not just navigating focus onto
+                        // it) should hand focus off to the content area.
+                        tvFocusTarget = .titleSearchField
+                        #endif
                     } label: {
                         VStack(spacing: 4) {
                             Image(systemName: iconName(for: type))
@@ -1676,84 +2020,138 @@ private struct ContentBrowserView: View {
                         .foregroundStyle(selectedContentType == type ? Color.accentColor : Color.primary)
                     }
                     .buttonStyle(.plain)
+                    #if os(tvOS)
+                    .focused($tvFocusTarget, equals: .tab(type))
+                    #endif
                 }
             }
             .padding(.horizontal, 8)
             .padding(.top, 8)
             .padding(.bottom, 6)
+            #if os(tvOS)
+            // Keeps left/right focus movement confined to the three tab
+            // buttons instead of escaping into the content area above;
+            // pressing a tab is the only thing that should move focus out.
+            .focusSection()
+            #endif
         }
-        .background(Color(.systemBackground))
+        .background(Color.appBackground)
     }
 
-    private func applyChannelFilters() {
-        let cleanTitle = debouncedTitleQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalizedTitle = cleanTitle.localizedLowercase
-        let cleanEPGKeyword = debouncedEPGKeywordQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        let favoriteTokens = favoriteCountryTokens
-        let matchingEPGChannelIDs = cleanEPGKeyword.isEmpty ? nil : epgIndex?.matchingChannelIDs(keyword: cleanEPGKeyword)
+    /// Snapshots the current channels + filter selection on the main thread,
+    /// then runs the (heavy) metadata build and filtering on a background task.
+    /// Managed objects never leave the main thread — only Sendable value copies
+    /// are handed off.
+    @MainActor
+    private func computeChannelProcessing(rebuildMetadata: Bool) async
+        -> (result: ChannelProcessingResult, channels: [ChannelEntity]) {
+        let currentChannels = channels
+        let rawInfos = currentChannels.map(ChannelRawInfo.init(channel:))
+        let cachedMetadata = rebuildMetadata ? nil : channelMetadataCache
+        let criteria = makeFilterCriteria()
+        let epg = epgIndex
 
-        filteredChannels = channels.filter { channel in
-            let metadata = channelFilterMetadata[channel.objectID]
+        let result = await Task.detached(priority: .userInitiated) {
+            ChannelProcessor.process(
+                rawInfos: rawInfos,
+                cachedMetadata: cachedMetadata,
+                criteria: criteria,
+                epgIndex: epg
+            )
+        }.value
 
-            if !cleanTitle.isEmpty,
-               !(metadata?.searchName.contains(normalizedTitle) ?? channel.name.localizedCaseInsensitiveContains(cleanTitle)) {
-                return false
-            }
+        return (result, currentChannels)
+    }
 
-            if favoritesOnly, !channel.isFavorite {
-                return false
-            }
-
-            if selectedCategoryName != allCategoryToken {
-                let category = metadata?.categoryName ?? channel.categoryName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if category.caseInsensitiveCompare(selectedCategoryName) != .orderedSame {
-                    return false
-                }
-            }
-
-            if selectedContentType != .live {
-                if selectedLanguageToken != allLanguageToken {
-                    let languageToken = metadata?.languageToken ?? languageToken(for: channel)
-                    if languageToken != selectedLanguageToken {
-                        return false
-                    }
-                }
-
-                if downloadedOnly, !channel.isDownloaded {
-                    return false
-                }
-            } else {
-                if !favoriteCountriesOnly, selectedCountryToken != allCountriesToken {
-                    let tokens = metadata?.countryTokens ?? countryTokens(for: channel)
-                    if !tokens.contains(selectedCountryToken) {
-                        return false
-                    }
-                }
-
-                if favoriteCountriesOnly {
-                    let tokens = metadata?.countryTokens ?? countryTokens(for: channel)
-                    if favoriteTokens.isEmpty || tokens.isDisjoint(with: favoriteTokens) {
-                        return false
-                    }
-                }
-
-                if !cleanEPGKeyword.isEmpty {
-                    guard let matchingEPGChannelIDs else {
-                        return false
-                    }
-                    let candidateIDs = metadata?.epgCandidateIDs ?? epgCandidateIDs(for: channel)
-                    if candidateIDs.isEmpty || candidateIDs.isDisjoint(with: matchingEPGChannelIDs) {
-                        return false
-                    }
-                }
-            }
-
-            return true
-        }
-        filteredPlayables = filteredChannels.map {
-            PlayableChannel(channel: $0, fallbackType: selectedContentType)
-        }
+    @MainActor
+    private func applyChannelProcessing(_ result: ChannelProcessingResult, channels currentChannels: [ChannelEntity]) {
+        channelMetadataCache = result.metadata
+        ContentBootstrapCache.shared.setMetadata(result.metadata, for: profile.id, contentType: selectedContentType)
+        filteredChannels = result.matchIndices.map { currentChannels[$0] }
+        filteredPlayables = result.playables
         visibleChannelLimit = initialVisibleChannelLimit
+
+        if let categoryOptions = result.categoryOptions,
+           let languageOptions = result.languageOptions,
+           let countryOptions = result.countryOptions {
+            applyFilterOptions(
+                categories: categoryOptions,
+                languages: languageOptions,
+                countries: countryOptions
+            )
+        }
+    }
+
+    /// Interactive (fire-and-forget) refilter for keystrokes / filter toggles /
+    /// tab switches. Keeps the current list on screen with a spinner until the
+    /// background pass finishes, and discards superseded results.
+    private func scheduleChannelRefilter(rebuildMetadata: Bool) {
+        channelFilterTask?.cancel()
+
+        channelFilterGeneration &+= 1
+        let generation = channelFilterGeneration
+
+        isFilteringChannels = true
+
+        channelFilterTask = Task { @MainActor in
+            let (result, currentChannels) = await computeChannelProcessing(rebuildMetadata: rebuildMetadata)
+            guard !Task.isCancelled, generation == channelFilterGeneration else { return }
+            applyChannelProcessing(result, channels: currentChannels)
+            isFilteringChannels = false
+        }
+    }
+
+    private func makeFilterCriteria() -> ChannelFilterCriteria {
+        let cleanTitle = debouncedTitleQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanEPGKeyword = debouncedEPGKeywordQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ChannelFilterCriteria(
+            cleanTitle: cleanTitle,
+            normalizedTitle: cleanTitle.localizedLowercase,
+            cleanEPGKeyword: cleanEPGKeyword,
+            favoritesOnly: favoritesOnly,
+            selectedCategoryName: selectedCategoryName,
+            allCategoryToken: allCategoryToken,
+            selectedLanguageToken: selectedLanguageToken,
+            allLanguageToken: allLanguageToken,
+            downloadedOnly: downloadedOnly,
+            isLive: selectedContentType == .live,
+            favoriteCountriesOnly: favoriteCountriesOnly,
+            selectedCountryToken: selectedCountryToken,
+            allCountriesToken: allCountriesToken,
+            favoriteCountryTokens: favoriteCountryTokens,
+            fallbackContentTypeRaw: selectedContentType.rawValue
+        )
+    }
+
+    /// Applies option lists produced by the background pass and reconciles any
+    /// now-invalid selections (sorting by display label is cheap here — the
+    /// option lists are small).
+    private func applyFilterOptions(categories: [String], languages: [String], countries: [String]) {
+        categoryOptions = categories.sorted {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        }
+        if selectedCategoryName != allCategoryToken, !categoryOptions.contains(selectedCategoryName) {
+            selectedCategoryName = allCategoryToken
+        }
+
+        languageOptions = languages.sorted {
+            languageDisplayLabel(for: $0).localizedCaseInsensitiveCompare(languageDisplayLabel(for: $1)) == .orderedAscending
+        }
+        if selectedLanguageToken != allLanguageToken, !languageOptions.contains(selectedLanguageToken) {
+            selectedLanguageToken = allLanguageToken
+        }
+
+        if selectedContentType == .live {
+            liveCountryOptions = countries.sorted {
+                countryDisplayLabel(for: $0).localizedCaseInsensitiveCompare(countryDisplayLabel(for: $1)) == .orderedAscending
+            }
+            if selectedCountryToken != allCountriesToken, !liveCountryOptions.contains(selectedCountryToken) {
+                selectedCountryToken = allCountriesToken
+            }
+        } else {
+            liveCountryOptions = []
+            selectedCountryToken = allCountriesToken
+        }
     }
 
     private func increaseVisibleChannelLimitIfNeeded() {
@@ -1791,6 +2189,10 @@ private struct ContentBrowserView: View {
         )
     }
 
+    /// Loads the current content type's channels for display. If that type's
+    /// metadata was already precomputed (during the initial load, or a previous
+    /// visit this session), it's reused so the switch is instant; otherwise it
+    /// is built off the main thread with a spinner.
     @MainActor
     private func loadChannelsFromStore() {
         do {
@@ -1799,92 +2201,228 @@ private struct ContentBrowserView: View {
                 contentType: selectedContentType,
                 in: viewContext
             )
-            visibleChannelLimit = initialVisibleChannelLimit
-            rebuildChannelFilterMetadata()
-            refreshFilterOptionsFromLoadedChannels()
-            applyChannelFilters()
         } catch {
             errorMessage = error.localizedDescription
+            return
+        }
+        visibleChannelLimit = initialVisibleChannelLimit
+
+        let cached = ContentBootstrapCache.shared.metadata(for: profile.id, contentType: selectedContentType)
+        if let cached, cached.count == channels.count {
+            channelMetadataCache = cached
+            scheduleChannelRefilter(rebuildMetadata: false)
+        } else {
+            scheduleChannelRefilter(rebuildMetadata: true)
         }
     }
 
+    // Loads EVERYTHING a profile needs up front, under one loading screen:
+    // channels, the EPG index, filter metadata, and the first screen of logos.
+    // When this returns and the overlay is dismissed, there is no remaining
+    // background work — browsing, searching, and scrolling operate purely on
+    // data already in memory, so the UI stays fast.
+    @MainActor
     private func bootstrapContentIfNeeded() async {
         guard !didBootstrap else {
-            // .task re-runs whenever this view reappears (e.g. after popping
-            // the player). The channel list is already held in @State and does
-            // not change just because a stream was watched, so avoid the
-            // expensive synchronous refetch + filter rebuild on the main thread
-            // that would freeze the UI for seconds. Only reload if we somehow
-            // have no data.
-            await MainActor.run {
-                if channels.isEmpty {
-                    loadChannelsFromStore()
-                }
-                isInitialLoading = false
-            }
+            // View reappeared (e.g. returning from the player). Everything is
+            // already in @State; nothing to reload.
+            isInitialLoading = false
             return
         }
 
-        await MainActor.run {
+        // Returning to this profile within the same app session: channels are
+        // in the store and the EPG index is still in memory, so just rebuild
+        // the in-memory view state (fast) without any network or re-index.
+        if ContentBootstrapCache.shared.hasBootstrapped(profile.id) {
             didBootstrap = true
             isInitialLoading = true
-            loadingMessage = "Contacting provider..."
+            loadingMessage = "Preparing channels…"
+            loadingProgress = 0.5
+            epgIndex = ContentBootstrapCache.shared.cachedEPGIndex(for: profile.id)
+            await loadChannelsFromStoreBlocking()
+            isInitialLoading = false
+            return
         }
+
+        didBootstrap = true
+        isInitialLoading = true
+        loadingProgress = 0
+        loadingMessage = "Preparing…"
+
+        let syncTypes = IPTVContentType.allCases.filter(shouldSyncOnLoad)
+        let epgEnabled = (try? IPTVDataStore.fetchOrCreateEPGConfig(profileID: profile.id, in: viewContext))?.isEnabled ?? false
+
+        // Only hit the network if this profile has never been synced to disk.
+        // Once synced, "Update content now" is the way to refresh — we don't
+        // silently re-download on every launch.
+        let hasLocalChannels = ((try? IPTVDataStore.fetchChannels(
+            profileID: profile.id,
+            contentType: selectedContentType,
+            in: viewContext
+        ).count) ?? 0) > 0
+        let willFetch = !hasLocalChannels
 
         let service = IPTVService()
         var transientError: String?
 
-        for type in IPTVContentType.allCases {
-            // Skip content types the user has opted out of syncing. Their
-            // previously stored channels are left untouched so disabling a type
-            // means "don't re-download it", not "delete it".
-            guard shouldSyncOnLoad(type) else { continue }
+        // Progress bands: network fetch 0→0.45, EPG 0.45→0.85, finalize 0.85→1.
+        let fetchBandEnd = willFetch ? 0.45 : 0.0
+        let epgBandStart = fetchBandEnd
+        let epgBandEnd = epgEnabled ? 0.85 : epgBandStart
 
-            await MainActor.run {
-                loadingMessage = "Loading \(type.displayName)..."
-            }
-
-            do {
-                let payloads = try await service.fetchChannels(for: profile, contentType: type)
-                await MainActor.run {
-                    do {
-                        try IPTVDataStore.replaceChannels(
-                            profileID: profile.id,
-                            contentType: type,
-                            channels: payloads,
-                            in: viewContext
-                        )
-                    } catch {
+        if willFetch {
+            for (index, type) in syncTypes.enumerated() {
+                loadingMessage = "Loading \(type.displayName)…"
+                do {
+                    let payloads = try await service.fetchChannels(for: profile, contentType: type)
+                    try IPTVDataStore.replaceChannels(
+                        profileID: profile.id,
+                        contentType: type,
+                        channels: payloads,
+                        in: viewContext
+                    )
+                } catch let error as IPTVServiceError {
+                    switch error {
+                    case .unsupportedProviderForContent, .noChannelsReturned:
+                        break
+                    default:
                         transientError = error.localizedDescription
                     }
+                } catch {
+                    transientError = error.localizedDescription
                 }
-            } catch let error as IPTVServiceError {
-                if case .unsupportedProviderForContent = error {
-                    continue
-                }
-                if case .noChannelsReturned = error {
-                    continue
-                }
-                transientError = error.localizedDescription
-            } catch {
-                transientError = error.localizedDescription
+                loadingProgress = fetchBandEnd * Double(index + 1) / Double(max(syncTypes.count, 1))
             }
         }
 
-        await MainActor.run {
-            loadingMessage = "Indexing EPG..."
+        // EPG download + index — done now, under the overlay, so nothing heavy
+        // runs once the user is browsing.
+        if epgEnabled {
+            loadingMessage = "Downloading EPG…"
+            await refreshEPGDuringBootstrapIfPossible(using: service)
+            loadingMessage = "Indexing EPG…"
+            await buildEPGIndexBlocking(bandStart: epgBandStart, bandEnd: epgBandEnd)
+        } else {
+            epgIndex = nil
         }
-        await refreshEPGDuringBootstrapIfPossible(using: service)
-        await loadEPGIndexIfAvailable()
 
-        await MainActor.run {
-            loadChannelsFromStore()
-            isInitialLoading = false
+        // Precompute filter metadata for EVERY enabled content type now, so
+        // switching tabs later is instant rather than triggering a fresh
+        // (heavy) metadata build. The current tab also gets its first screen
+        // of logos warmed.
+        loadingMessage = "Preparing channels…"
+        loadingProgress = max(loadingProgress, epgBandEnd)
+        let finalizeBand = 1.0 - epgBandEnd
+        for (index, type) in syncTypes.enumerated() {
+            await precomputeMetadata(for: type, prefetchLogos: type == selectedContentType)
+            loadingProgress = epgBandEnd + finalizeBand * Double(index + 1) / Double(max(syncTypes.count, 1)) * 0.9
+        }
 
-            if channels.isEmpty, let transientError {
-                errorMessage = transientError
+        // Load the current tab for display (reuses the metadata just built).
+        await loadChannelsFromStoreBlocking()
+
+        if channels.isEmpty, let transientError {
+            errorMessage = transientError
+        }
+        ContentBootstrapCache.shared.markBootstrapped(profile.id)
+        ContentBootstrapCache.shared.setEPGIndex(epgIndex, for: profile.id)
+        loadingProgress = 1
+        isInitialLoading = false
+    }
+
+    /// Fetches the current content type's channels from the store and applies
+    /// the filter, awaiting completion (used under the loading overlay during
+    /// bootstrap). Reuses precomputed metadata when available.
+    @MainActor
+    private func loadChannelsFromStoreBlocking() async {
+        do {
+            channels = try IPTVDataStore.fetchChannels(
+                profileID: profile.id,
+                contentType: selectedContentType,
+                in: viewContext
+            )
+        } catch {
+            errorMessage = error.localizedDescription
+            return
+        }
+        visibleChannelLimit = initialVisibleChannelLimit
+
+        let cached = ContentBootstrapCache.shared.metadata(for: profile.id, contentType: selectedContentType)
+        let reuse = cached?.count == channels.count
+        if reuse, let cached {
+            channelMetadataCache = cached
+        }
+        let (result, currentChannels) = await computeChannelProcessing(rebuildMetadata: !reuse)
+        applyChannelProcessing(result, channels: currentChannels)
+    }
+
+    /// Builds (and caches) the filter metadata for a content type without
+    /// displaying it, so a later tab switch to it is instant. Optionally warms
+    /// the first screen of that type's logos too.
+    @MainActor
+    private func precomputeMetadata(for type: IPTVContentType, prefetchLogos: Bool) async {
+        let typeChannels: [ChannelEntity]
+        do {
+            typeChannels = try IPTVDataStore.fetchChannels(
+                profileID: profile.id,
+                contentType: type,
+                in: viewContext
+            )
+        } catch {
+            return
+        }
+
+        if ContentBootstrapCache.shared.metadata(for: profile.id, contentType: type)?.count != typeChannels.count {
+            let rawInfos = typeChannels.map(ChannelRawInfo.init(channel:))
+            let epg = epgIndex
+            let metadata = await Task.detached(priority: .userInitiated) {
+                ChannelProcessor.buildMetadata(rawInfos: rawInfos, epgIndex: epg)
+            }.value
+            ContentBootstrapCache.shared.setMetadata(metadata, for: profile.id, contentType: type)
+        }
+
+        if prefetchLogos {
+            let urls = typeChannels.prefix(initialVisibleChannelLimit)
+                .compactMap { $0.logoURL.flatMap(URL.init(string:)) }
+            if !urls.isEmpty {
+                await ChannelImageLoader.shared.prefetch(urls: urls, maxPixelSize: 208)
             }
         }
+    }
+
+    /// Downloads (if needed) and indexes the EPG synchronously as part of the
+    /// startup load, mapping index progress into the given overlay band.
+    @MainActor
+    private func buildEPGIndexBlocking(bandStart: Double, bandEnd: Double) async {
+        let xmlData: Data? = {
+            guard let config = try? IPTVDataStore.fetchOrCreateEPGConfig(profileID: profile.id, in: viewContext),
+                  config.isEnabled else { return nil }
+            return config.lastXMLData
+        }()
+
+        guard let xmlData, !xmlData.isEmpty else {
+            epgIndex = nil
+            loadingProgress = bandEnd
+            return
+        }
+
+        let reporter = EPGProgressReporter()
+        let pollTask = Task { @MainActor in
+            while !Task.isCancelled {
+                loadingProgress = bandStart + (bandEnd - bandStart) * reporter.fraction
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+        }
+
+        let builtIndex = await Task.detached(priority: .userInitiated) {
+            EPGIndex.build(from: xmlData) { fraction in
+                reporter.fraction = fraction
+            }
+        }.value
+
+        pollTask.cancel()
+        epgIndex = builtIndex
+        loadingProgress = bandEnd
     }
 
     private func shouldSyncOnLoad(_ type: IPTVContentType) -> Bool {
@@ -1902,80 +2440,16 @@ private struct ContentBrowserView: View {
         await MainActor.run {
             channels = []
             filteredChannels = []
+            filteredPlayables = []
             visibleChannelLimit = initialVisibleChannelLimit
-            channelFilterMetadata = [:]
+            channelMetadataCache = []
             didBootstrap = false
             isInitialLoading = true
             loadingMessage = "Updating profile..."
+            ContentBootstrapCache.shared.invalidate(profile.id)
         }
 
         await bootstrapContentIfNeeded()
-    }
-
-    @MainActor
-    private func refreshFilterOptionsFromLoadedChannels() {
-        let cleanedCategories = channels
-            .map { channelFilterMetadata[$0.objectID]?.categoryName ?? "" }
-            .filter { !$0.isEmpty }
-        categoryOptions = Array(Set(cleanedCategories)).sorted {
-            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
-        }
-        if selectedCategoryName != allCategoryToken, !categoryOptions.contains(selectedCategoryName) {
-            selectedCategoryName = allCategoryToken
-        }
-
-        let detectedLanguages = channels.compactMap { channelFilterMetadata[$0.objectID]?.languageToken }
-        languageOptions = Array(Set(detectedLanguages)).sorted {
-            languageDisplayLabel(for: $0).localizedCaseInsensitiveCompare(languageDisplayLabel(for: $1)) == .orderedAscending
-        }
-        if selectedLanguageToken != allLanguageToken, !languageOptions.contains(selectedLanguageToken) {
-            selectedLanguageToken = allLanguageToken
-        }
-
-        if selectedContentType == .live {
-            var countries = Set<String>()
-            for channel in channels {
-                countries.formUnion(channelFilterMetadata[channel.objectID]?.countryTokens ?? [])
-            }
-            liveCountryOptions = Array(countries).sorted {
-                countryDisplayLabel(for: $0).localizedCaseInsensitiveCompare(countryDisplayLabel(for: $1)) == .orderedAscending
-            }
-            if selectedCountryToken != allCountriesToken, !liveCountryOptions.contains(selectedCountryToken) {
-                selectedCountryToken = allCountriesToken
-            }
-        } else {
-            selectedCountryToken = allCountriesToken
-        }
-    }
-
-    private func loadEPGIndexIfAvailable() async {
-        let xmlData = await MainActor.run { () -> Data? in
-            do {
-                let config = try IPTVDataStore.fetchOrCreateEPGConfig(profileID: profile.id, in: viewContext)
-                return config.lastXMLData
-            } catch {
-                errorMessage = error.localizedDescription
-                return nil
-            }
-        }
-
-        guard let xmlData, !xmlData.isEmpty else {
-            await MainActor.run {
-                epgIndex = nil
-            }
-            return
-        }
-
-        // Parsing/indexing the EPG XML is CPU-heavy and must not run on the main
-        // thread, or it freezes the UI (unresponsive buttons, laggy sheet
-        // dismissals) for the seconds it takes to build.
-        let builtIndex = await Task.detached(priority: .utility) {
-            EPGIndex.build(from: xmlData)
-        }.value
-
-        await MainActor.run {
-            epgIndex = builtIndex
-        }
     }
 
     private func refreshEPGDuringBootstrapIfPossible(using service: IPTVService) async {
@@ -2009,81 +2483,8 @@ private struct ContentBrowserView: View {
     }
 
     @MainActor
-    private func rebuildChannelFilterMetadata() {
-        var metadataByID: [NSManagedObjectID: ChannelFilterMetadata] = [:]
-        metadataByID.reserveCapacity(channels.count)
-
-        for channel in channels {
-            let categoryName = channel.categoryName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            metadataByID[channel.objectID] = ChannelFilterMetadata(
-                searchName: channel.name.localizedLowercase,
-                categoryName: categoryName,
-                languageToken: languageToken(for: channel),
-                countryTokens: countryTokens(for: channel),
-                epgCandidateIDs: epgCandidateIDs(for: channel)
-            )
-        }
-
-        channelFilterMetadata = metadataByID
-    }
-
-    private func countryTokens(for channel: ChannelEntity) -> Set<String> {
-        var tokens = CountryExtractor.extractTokens(from: channel.name)
-        if let categoryName = channel.categoryName {
-            tokens.formUnion(CountryExtractor.extractTokens(from: categoryName))
-        }
-        if !tokens.isEmpty {
-            return tokens
-        }
-
-        guard let epgIndex,
-              let explicitID = channel.epgChannelID?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !explicitID.isEmpty else {
-            return []
-        }
-
-        return epgIndex.countries(forChannelID: explicitID)
-    }
-
-    private func epgCandidateIDs(for channel: ChannelEntity) -> Set<String> {
-        guard let epgIndex else { return [] }
-
-        var candidateIDs = Set<String>()
-        if let explicitID = channel.epgChannelID?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !explicitID.isEmpty {
-            candidateIDs.insert(explicitID)
-        }
-        candidateIDs.formUnion(epgIndex.candidateChannelIDs(forChannelName: channel.name))
-        return candidateIDs
-    }
-
     private func countryDisplayLabel(for token: String) -> String {
         CountryExtractor.displayLabel(for: token)
-    }
-
-    private func languageToken(for channel: ChannelEntity) -> String? {
-        if let rawLanguage = channel.language?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !rawLanguage.isEmpty {
-            let upper = rawLanguage.uppercased()
-            if upper.count <= 3, upper.allSatisfy(\.isLetter) {
-                return upper
-            }
-
-            let normalized = upper.replacingOccurrences(of: "-", with: " ")
-            if normalized.contains("EN") || normalized.contains("ENGLISH") { return "EN" }
-            if normalized.contains("FR") || normalized.contains("FRENCH") { return "FR" }
-            if normalized.contains("ES") || normalized.contains("SPANISH") { return "ES" }
-            if normalized.contains("PT") || normalized.contains("PORTUGUESE") { return "PT" }
-            if normalized.contains("AR") || normalized.contains("ARABIC") { return "AR" }
-        }
-
-        let namePrefix = channel.name.split(separator: "|", maxSplits: 1).first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let upperPrefix = namePrefix.uppercased()
-        if (2...3).contains(upperPrefix.count), upperPrefix.allSatisfy(\.isLetter) {
-            return upperPrefix
-        }
-
-        return nil
     }
 
     private func languageDisplayLabel(for token: String) -> String {
@@ -2131,7 +2532,7 @@ private struct ContentBrowserView: View {
         let pendingQuery = titleQuery
         if pendingQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             debouncedTitleQuery = ""
-            applyChannelFilters()
+            scheduleChannelRefilter(rebuildMetadata: false)
             return
         }
 
@@ -2140,7 +2541,7 @@ private struct ContentBrowserView: View {
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 debouncedTitleQuery = pendingQuery
-                applyChannelFilters()
+                scheduleChannelRefilter(rebuildMetadata: false)
             }
         }
     }
@@ -2150,7 +2551,7 @@ private struct ContentBrowserView: View {
         let pendingQuery = epgKeywordQuery
         if pendingQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             debouncedEPGKeywordQuery = ""
-            applyChannelFilters()
+            scheduleChannelRefilter(rebuildMetadata: false)
             return
         }
 
@@ -2159,7 +2560,7 @@ private struct ContentBrowserView: View {
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 debouncedEPGKeywordQuery = pendingQuery
-                applyChannelFilters()
+                scheduleChannelRefilter(rebuildMetadata: false)
             }
         }
     }
@@ -2170,7 +2571,7 @@ private struct ContentBrowserView: View {
             try? await Task.sleep(nanoseconds: 75_000_000)
             guard !Task.isCancelled else { return }
             await MainActor.run {
-                applyChannelFilters()
+                scheduleChannelRefilter(rebuildMetadata: false)
             }
         }
     }
@@ -2211,7 +2612,7 @@ private struct ContentBrowserView: View {
         favoriteCountriesOnly = false
         favoritesOnly = false
         downloadedOnly = false
-        applyChannelFilters()
+        scheduleChannelRefilter(rebuildMetadata: false)
     }
 
     private func toggleFavoriteCountry(_ token: String) {
@@ -2243,8 +2644,15 @@ private struct ContentBrowserView: View {
     @MainActor
     private func toggleFavorite(_ channel: ChannelEntity) {
         do {
+            // Favorite status isn't part of ChannelFilterMetadata or the filter
+            // option lists, so a full loadChannelsFromStore() (Core Data
+            // re-fetch + metadata rebuild + filter-options rebuild over every
+            // channel) is unnecessary here and was the actual cause of the
+            // multi-second "hang" on a single star tap. Only the visible
+            // filtered list needs recomputing (e.g. to drop the channel when
+            // "Favorites only" is active).
             try IPTVDataStore.setFavorite(!channel.isFavorite, for: channel, in: viewContext)
-            loadChannelsFromStore()
+            scheduleChannelRefilter(rebuildMetadata: false)
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -2416,7 +2824,9 @@ private struct FilterOptionSheet: View {
             }
         }
         .navigationTitle(title)
+        #if !os(tvOS)
         .navigationBarTitleDisplayMode(.inline)
+        #endif
         .searchable(text: $searchText, prompt: "Search \(title.lowercased())")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -2485,24 +2895,14 @@ private struct ChannelGridCard: View {
         VStack(alignment: .leading, spacing: 8) {
             Group {
                 if let imageURL, let url = URL(string: imageURL) {
-                    AsyncImage(url: url) { phase in
-                        switch phase {
-                        case let .success(image):
-                            image
-                                .resizable()
-                                .aspectRatio(contentMode: contentType == .live ? .fit : .fill)
-                                .padding(contentType == .live ? 10 : 0)
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        case .failure:
-                            placeholder
-                        case .empty:
-                            ZStack {
-                                placeholder
-                                ProgressView()
-                            }
-                        @unknown default:
-                            placeholder
-                        }
+                    CachedAsyncImage(url: url, maxPixelSize: imageHeight * 2) { image in
+                        image
+                            .resizable()
+                            .aspectRatio(contentMode: contentType == .live ? .fit : .fill)
+                            .padding(contentType == .live ? 10 : 0)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } placeholder: {
+                        placeholder
                     }
                 } else {
                     placeholder
@@ -2510,7 +2910,7 @@ private struct ChannelGridCard: View {
             }
             .frame(maxWidth: .infinity)
             .frame(height: imageHeight)
-            .background(Color(.tertiarySystemBackground))
+            .background(Color.appTertiaryBackground)
             .clipped()
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(
@@ -2550,23 +2950,20 @@ private struct ChannelLogoThumbnail: View {
     var body: some View {
         Group {
             if let imageURL, let url = URL(string: imageURL) {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case let .success(image):
-                        image
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .padding(4)
-                    default:
-                        placeholder
-                    }
+                CachedAsyncImage(url: url, maxPixelSize: size * 2) { image in
+                    image
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .padding(4)
+                } placeholder: {
+                    placeholder
                 }
             } else {
                 placeholder
             }
         }
         .frame(width: size, height: size)
-        .background(Color(.tertiarySystemBackground))
+        .background(Color.appTertiaryBackground)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
@@ -2582,6 +2979,7 @@ private struct ChannelLogoThumbnail: View {
 
 private struct FunnyLoadingOverlay: View {
     let message: String
+    var progress: Double = 0
 
     @State private var rotateDish = false
     @State private var bouncePopcorn = false
@@ -2606,6 +3004,10 @@ private struct FunnyLoadingOverlay: View {
                 Text(message)
                     .font(.headline)
                     .foregroundStyle(.white)
+
+                ProgressView(value: progress)
+                    .tint(.cyan)
+                    .frame(width: 220)
 
                 Text("Gathering channels from deep space...")
                     .font(.subheadline)
@@ -2693,12 +3095,14 @@ private struct SeriesEpisodesView: View {
                             .disabled(activeDownloadIDs.contains(episode.streamID))
                         }
 
+                        #if !os(tvOS)
                         Button {
                             UIPasteboard.general.string = episode.streamURL
                             infoMessage = "Stream URL copied"
                         } label: {
                             Label("Copy Stream URL", systemImage: "doc.on.doc")
                         }
+                        #endif
                     } label: {
                         Image(systemName: "ellipsis.circle")
                             .foregroundStyle(.secondary)
@@ -2884,7 +3288,9 @@ private struct DownloadsView: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
+                #if !os(tvOS)
                 .keyboardShortcut(.cancelAction)
+                #endif
                 .accessibilityLabel("Close Downloads")
             }
             .padding(.horizontal, 24)
@@ -2897,7 +3303,7 @@ private struct DownloadsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                ForEach(channels) { channel in
+                ForEach(channels, id: \.objectID) { channel in
                     NavigationLink {
                         PlayerView(
                             title: channel.name,
@@ -2917,14 +3323,26 @@ private struct DownloadsView: View {
                             }
                         }
                     }
+                    #if !os(tvOS)
                     .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                         Button("Delete", role: .destructive) {
                             removeOffline(channel)
                         }
                     }
+                    #else
+                    .contextMenu {
+                        Button("Delete", role: .destructive) {
+                            removeOffline(channel)
+                        }
+                    }
+                    #endif
                 }
             }
+            #if os(tvOS)
+            .listStyle(.plain)
+            #else
             .listStyle(.insetGrouped)
+            #endif
         }
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
@@ -3048,6 +3466,8 @@ enum RecentChannelsStore {
 }
 
 private struct PlayerView: View {
+    private static let logger = Logger(subsystem: "ThreeAM.Apps.IPTV-Client", category: "Playback")
+
     let title: String
     let streamURL: String
     let localFilePath: String?
@@ -3098,8 +3518,16 @@ private struct PlayerView: View {
     @State private var isClosing = false
     @State private var currentIndex: Int?
     @State private var displayTitle: String
+    @State private var isPrimaryFavorite = false
     @State private var recents: [PlayableChannel] = []
     @State private var showRecents = false
+    @State private var lastPlaybackAction = ""
+    @State private var isPlaybackMuted = false
+    @State private var lastAudibleVolume: Float = 1
+    #if os(tvOS) || targetEnvironment(macCatalyst)
+    @State private var controlsVisible = true
+    @State private var controlsHideTask: Task<Void, Never>?
+    #endif
 
     private let maxScreens = 4
 
@@ -3133,6 +3561,51 @@ private struct PlayerView: View {
         canNavigatePlaylist && (currentIndex == nil || (currentIndex ?? 0) < playlist.count - 1)
     }
 
+    #if os(tvOS) || targetEnvironment(macCatalyst)
+    private func showControls() {
+        controlsHideTask?.cancel()
+        withAnimation {
+            controlsVisible = true
+        }
+    }
+
+    private func scheduleControlsHide(after seconds: UInt64) {
+        controlsHideTask?.cancel()
+        controlsHideTask = Task {
+            try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                withAnimation {
+                    controlsVisible = false
+                }
+            }
+        }
+    }
+
+    private func revealControlsTemporarily() {
+        showControls()
+        scheduleControlsHide(after: 4)
+    }
+    #endif
+
+    #if targetEnvironment(macCatalyst)
+    private var topChromeHoverZone: some View {
+        Rectangle()
+            .fill(Color.black.opacity(0.001))
+            .frame(maxWidth: .infinity)
+            .frame(height: controlsVisible ? 96 : 36)
+            .contentShape(Rectangle())
+            .onHover { isHovering in
+                if isHovering {
+                    showControls()
+                } else {
+                    scheduleControlsHide(after: 2)
+                }
+            }
+            .allowsHitTesting(true)
+    }
+    #endif
+
     var body: some View {
         Group {
             if isClosing {
@@ -3144,8 +3617,26 @@ private struct PlayerView: View {
                 singleScreenPlayer
             }
         }
+        #if os(tvOS) || targetEnvironment(macCatalyst)
+        .ignoresSafeArea()
+        .onAppear {
+            revealControlsTemporarily()
+        }
+        .simultaneousGesture(
+            TapGesture().onEnded {
+                revealControlsTemporarily()
+            }
+        )
+        #if targetEnvironment(macCatalyst)
+        .overlay(alignment: .top) {
+            topChromeHoverZone
+        }
+        #endif
+        #endif
         .navigationTitle(displayTitle)
+        #if !os(tvOS)
         .navigationBarTitleDisplayMode(.inline)
+        #endif
         .navigationBarBackButtonHidden(true)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
@@ -3175,6 +3666,23 @@ private struct PlayerView: View {
             }
 
             ToolbarItemGroup(placement: .topBarTrailing) {
+                Button {
+                    togglePlaybackMute()
+                } label: {
+                    Image(systemName: isEffectivelyMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                }
+                .disabled(isClosing || primaryPlayer == nil)
+                .accessibilityLabel(isEffectivelyMuted ? "Unmute" : "Mute")
+
+                if slots.count <= 1 {
+                    Button {
+                        togglePrimaryFavorite()
+                    } label: {
+                        Image(systemName: isPrimaryFavorite ? "star.fill" : "star")
+                    }
+                    .disabled(isClosing)
+                }
+
                 if !recents.isEmpty && slots.count <= 1 {
                     Button {
                         showRecents.toggle()
@@ -3182,9 +3690,15 @@ private struct PlayerView: View {
                         Image(systemName: "clock.arrow.circlepath")
                     }
                     .disabled(isClosing)
+                    #if os(tvOS)
+                    .sheet(isPresented: $showRecents) {
+                        recentsPopover
+                    }
+                    #else
                     .popover(isPresented: $showRecents) {
                         recentsPopover
                     }
+                    #endif
                 }
 
                 Button("Add Channels") {
@@ -3241,8 +3755,15 @@ private struct PlayerView: View {
                     .frame(width: 24, height: 24)
             }
         }
+        #if os(tvOS)
+        .toolbar(controlsVisible ? .visible : .hidden, for: .automatic)
+        #elseif targetEnvironment(macCatalyst)
+        .toolbar(controlsVisible ? .visible : .hidden, for: .navigationBar)
+        .toolbarBackground(controlsVisible ? .visible : .hidden, for: .navigationBar)
+        #endif
         .task {
             initializePrimaryScreenIfNeeded()
+            refreshPrimaryFavoriteState()
             if showPlaybackDiagnostics {
                 startDiagnosticsLoopIfNeeded()
             }
@@ -3285,6 +3806,57 @@ private struct PlayerView: View {
         slots.first
     }
 
+    private var isEffectivelyMuted: Bool {
+        guard let player = primaryPlayer else { return isPlaybackMuted }
+        return isPlaybackMuted || player.isMuted || player.volume <= 0.01
+    }
+
+    /// Provides a reliable escape from AVPlayerViewController's volume slider
+    /// getting stuck at zero. If the native control has already reduced the
+    /// player to silence, the first press restores audio immediately.
+    private func togglePlaybackMute() {
+        setPlaybackMuted(!isEffectivelyMuted)
+    }
+
+    private func setPlaybackMuted(_ muted: Bool) {
+        if muted,
+           let audibleVolume = players.values
+            .map(\.volume)
+            .first(where: { $0 > 0.01 }) {
+            lastAudibleVolume = audibleVolume
+        }
+
+        isPlaybackMuted = muted
+        for player in players.values {
+            player.isMuted = muted
+            if !muted, player.volume <= 0.01 {
+                player.volume = max(lastAudibleVolume, 0.25)
+            }
+        }
+        lastPlaybackAction = muted ? "Muted playback" : "Unmuted playback"
+    }
+
+    private func adjustPlaybackVolume(by step: Float) {
+        let currentVolume = primaryPlayer?.volume ?? lastAudibleVolume
+        setPlaybackVolume(currentVolume + step)
+    }
+
+    private func setPlaybackVolume(_ volume: Float) {
+        let clampedVolume = min(max(volume, 0), 1)
+        if clampedVolume <= 0.01 {
+            setPlaybackMuted(true)
+            return
+        }
+
+        isPlaybackMuted = false
+        lastAudibleVolume = clampedVolume
+        for player in players.values {
+            player.isMuted = false
+            player.volume = clampedVolume
+        }
+        lastPlaybackAction = "Volume \(Int((clampedVolume * 100).rounded()))%"
+    }
+
     private var activePrimaryStreamMode: PlaybackStreamMode {
         guard let primarySlot else { return .original }
         return streamModes[primarySlot.id] ?? preferredStreamMode(for: primarySlot)
@@ -3302,7 +3874,24 @@ private struct PlayerView: View {
     private var singleScreenPlayer: some View {
         ZStack(alignment: .topLeading) {
             if let player = primaryPlayer {
+                #if os(tvOS)
+                AVPlayerControllerView(
+                    player: player,
+                    isMuted: isEffectivelyMuted,
+                    volume: isEffectivelyMuted ? 0 : player.volume,
+                    onToggleMute: { togglePlaybackMute() },
+                    onVolumeDown: { adjustPlaybackVolume(by: -0.1) },
+                    onVolumeUp: { adjustPlaybackVolume(by: 0.1) },
+                    isFavorite: isPrimaryFavorite,
+                    onToggleFavorite: { togglePrimaryFavorite() },
+                    canGoNext: canGoNext,
+                    onNext: { goToNextChannel() },
+                    canGoPrevious: canGoPrevious,
+                    onPrevious: { goToPreviousChannel() }
+                )
+                #else
                 AVPlayerControllerView(player: player)
+                #endif
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "play.slash")
@@ -3484,6 +4073,7 @@ private struct PlayerView: View {
             localFilePath: localFilePath
         )
         slots = [primary]
+        lastPlaybackAction = "Starting \(title)"
         createPlayerIfNeeded(for: primary)
         refreshSubtitleGroup(for: players[primary.id]?.currentItem)
 
@@ -3504,6 +4094,28 @@ private struct PlayerView: View {
     }
 
     // MARK: - Playlist navigation
+
+    private func refreshPrimaryFavoriteState() {
+        guard let streamURL = primarySlot?.streamURL, let profileID else {
+            isPrimaryFavorite = false
+            return
+        }
+        let channel = try? IPTVDataStore.channel(profileID: profileID, streamURL: streamURL, in: viewContext)
+        isPrimaryFavorite = channel?.isFavorite ?? false
+    }
+
+    private func togglePrimaryFavorite() {
+        guard let streamURL = primarySlot?.streamURL, let profileID else { return }
+        do {
+            guard let channel = try IPTVDataStore.channel(profileID: profileID, streamURL: streamURL, in: viewContext) else {
+                return
+            }
+            try IPTVDataStore.setFavorite(!channel.isFavorite, for: channel, in: viewContext)
+            isPrimaryFavorite = channel.isFavorite
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
 
     private func goToNextChannel() {
         guard canGoNext else { return }
@@ -3529,27 +4141,60 @@ private struct PlayerView: View {
     private func playChannel(_ item: PlayableChannel, playlistIndex: Int?) {
         guard slots.count <= 1, let previous = slots.first else { return }
 
-        if let player = players[previous.id] {
-            DeferredPlayerTeardown.shared.enqueue([player])
-        }
-        players[previous.id] = nil
-        streamModes[previous.id] = nil
-        diagnosticsBySlotID[previous.id] = nil
-        hlsFallbackAttempts.remove(previous.id)
-        hlsFallbackTasks[previous.id]?.cancel()
-        hlsFallbackTasks[previous.id] = nil
-
         let newSlot = ScreenSlot(
             title: item.title,
             streamURL: item.streamURL,
             localFilePath: item.localFilePath
         )
-        slots = [newSlot]
+
+        let mode = preferredStreamMode(for: newSlot)
+        guard let mediaURL = resolvedMediaURL(for: newSlot, mode: mode) else {
+            let message = "Invalid media URL for \(item.title)"
+            PlayerView.logger.error("\(message, privacy: .public)")
+            errorMessage = message
+            return
+        }
+
+        PlayerView.logger.notice(
+            "Switching channel from '\(previous.title, privacy: .public)' to '\(item.title, privacy: .public)' at index \(playlistIndex ?? -1, privacy: .public). URL: \(mediaURL.absoluteString, privacy: .public)"
+        )
+        lastPlaybackAction = "Switching to \(item.title)"
+
+        hlsFallbackTasks[previous.id]?.cancel()
+        hlsFallbackTasks[previous.id] = nil
+        streamModes[previous.id] = nil
+        diagnosticsBySlotID[previous.id] = nil
+        hlsFallbackAttempts.remove(previous.id)
+
         currentIndex = playlistIndex
         displayTitle = item.title
 
-        createPlayerIfNeeded(for: newSlot)
-        refreshSubtitleGroup(for: players[newSlot.id]?.currentItem)
+        if let player = players.removeValue(forKey: previous.id) {
+            player.pause()
+            player.cancelPendingPrerolls()
+            player.currentItem?.cancelPendingSeeks()
+            player.currentItem?.asset.cancelLoading()
+
+            let playerItem = AVPlayerItem(url: mediaURL)
+            streamModes[newSlot.id] = mode
+            players[newSlot.id] = player
+            slots = [newSlot]
+            player.replaceCurrentItem(with: playerItem)
+            player.play()
+            refreshSubtitleGroup(for: playerItem)
+
+            if showPlaybackDiagnostics {
+                refreshPlaybackDiagnostics()
+            }
+            scheduleHLSFallbackIfNeeded(for: newSlot)
+        } else {
+            PlayerView.logger.warning("Primary player missing while switching channels; creating a replacement player.")
+            slots = [newSlot]
+            createPlayerIfNeeded(for: newSlot)
+            refreshSubtitleGroup(for: players[newSlot.id]?.currentItem)
+        }
+
+        refreshPrimaryFavoriteState()
         recordRecent(item)
         reloadRecents()
     }
@@ -3690,6 +4335,10 @@ private struct PlayerView: View {
 
         isClosing = true
         stopDiagnosticsLoop()
+        #if os(tvOS) || targetEnvironment(macCatalyst)
+        controlsHideTask?.cancel()
+        controlsHideTask = nil
+        #endif
         subtitleTask?.cancel()
         subtitleTask = nil
         subtitleGroup = nil
@@ -3785,14 +4434,22 @@ private struct PlayerView: View {
 
         guard let mediaURL = resolvedMediaURL(for: slot, mode: mode) else {
             errorMessage = "Invalid media URL for \(slot.title)"
+            PlayerView.logger.error("Invalid media URL while creating player for '\(slot.title, privacy: .public)'")
             return
         }
 
         AudioSessionConfigurator.configureIfNeeded()
 
+        PlayerView.logger.notice(
+            "Creating player for '\(slot.title, privacy: .public)' using \(mediaURL.absoluteString, privacy: .public)"
+        )
         let avPlayer = AVPlayer(url: mediaURL)
         avPlayer.allowsExternalPlayback = true
         avPlayer.automaticallyWaitsToMinimizeStalling = true
+        avPlayer.isMuted = isPlaybackMuted
+        if !isPlaybackMuted, avPlayer.volume <= 0.01 {
+            avPlayer.volume = max(lastAudibleVolume, 0.25)
+        }
         avPlayer.play()
         players[slot.id] = avPlayer
         if showPlaybackDiagnostics {
@@ -3838,6 +4495,9 @@ private struct PlayerView: View {
             return PlaybackDiagnostics(lines: lines)
         }
 
+        if !lastPlaybackAction.isEmpty {
+            lines.append("Action: \(shortDiagnosticText(lastPlaybackAction, limit: 44))")
+        }
         lines.append("Player: \(playerTimeControlText(player))")
 
         if let currentItem = player.currentItem {
@@ -4028,6 +4688,8 @@ private struct PlayerView: View {
 
         hlsFallbackAttempts.insert(slot.id)
         streamModes[slot.id] = .hls
+        lastPlaybackAction = "HLS fallback for \(slot.title)"
+        PlayerView.logger.notice("Trying HLS fallback for '\(slot.title, privacy: .public)'")
         let item = AVPlayerItem(url: fallbackURL)
         player.replaceCurrentItem(with: item)
         player.play()
@@ -4050,6 +4712,10 @@ private struct PlayerView: View {
 
         streamModes[primarySlot.id] = newMode
         hlsFallbackAttempts.insert(primarySlot.id)
+        lastPlaybackAction = "Switching mode for \(primarySlot.title)"
+        PlayerView.logger.notice(
+            "Switching stream mode for '\(primarySlot.title, privacy: .public)' to \(newMode.rawValue, privacy: .public)"
+        )
         let item = AVPlayerItem(url: mediaURL)
         player.replaceCurrentItem(with: item)
         player.play()
@@ -4128,26 +4794,24 @@ private enum AudioSessionConfigurator {
 private final class DeferredPlayerTeardown {
     static let shared = DeferredPlayerTeardown()
 
-    // Serial background queue so tearing down a live stream's network/demuxer
-    // pipeline never blocks the main thread (which would freeze the UI for
-    // several seconds after leaving playback).
-    private let teardownQueue = DispatchQueue(label: "com.iptvclient.player-teardown", qos: .utility)
+    private var retainedPlayers: [ObjectIdentifier: AVPlayer] = [:]
 
     func enqueue(_ players: [AVPlayer]) {
         guard !players.isEmpty else { return }
 
-        // Stop playback immediately on the main thread. pause() is cheap and
-        // cuts audio at once; the expensive work is releasing the item.
+        let identifiers = players.map { ObjectIdentifier($0) }
         for player in players {
+            retainedPlayers[ObjectIdentifier(player)] = player
             player.pause()
+            player.cancelPendingPrerolls()
+            player.currentItem?.cancelPendingSeeks()
+            player.currentItem?.asset.cancelLoading()
         }
 
-        // Do the costly item/network teardown off the main thread. Capturing
-        // the players here keeps them alive until the closure finishes, so
-        // their deinit also runs on the background queue rather than blocking
-        // the UI.
-        teardownQueue.async {
-            for player in players {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_250_000_000)
+            for identifier in identifiers {
+                guard let player = retainedPlayers.removeValue(forKey: identifier) else { continue }
                 player.replaceCurrentItem(with: nil)
             }
         }
@@ -4157,23 +4821,119 @@ private final class DeferredPlayerTeardown {
 private struct AVPlayerControllerView: UIViewControllerRepresentable {
     let player: AVPlayer
 
+    #if os(tvOS)
+    // On tvOS the AVPlayerViewController owns the focus environment, so the
+    // SwiftUI toolbar over it is unreachable. These actions are surfaced in the
+    // player's own transport bar instead (revealed by swiping down on the
+    // remote), which is the only focusable place for them.
+    var isMuted = false
+    var volume: Float = 1
+    var onToggleMute: (() -> Void)?
+    var onVolumeDown: (() -> Void)?
+    var onVolumeUp: (() -> Void)?
+    var isFavorite = false
+    var onToggleFavorite: (() -> Void)?
+    var canGoNext = false
+    var onNext: (() -> Void)?
+    var canGoPrevious = false
+    var onPrevious: (() -> Void)?
+    #endif
+
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         let controller = AVPlayerViewController()
         controller.player = player
         controller.showsPlaybackControls = true
         controller.allowsPictureInPicturePlayback = true
+        #if !os(tvOS)
         controller.canStartPictureInPictureAutomaticallyFromInline = false
         controller.updatesNowPlayingInfoCenter = true
+        #else
+        controller.transportBarCustomMenuItems = makeTransportBarItems()
+        #endif
         return controller
     }
 
     func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {
         uiViewController.player = player
+        #if os(tvOS)
+        uiViewController.transportBarCustomMenuItems = makeTransportBarItems()
+        #endif
     }
 
     static func dismantleUIViewController(_ uiViewController: AVPlayerViewController, coordinator: ()) {
         uiViewController.player = nil
     }
+
+    #if os(tvOS)
+    private func makeTransportBarItems() -> [UIMenuElement] {
+        var channelActions: [UIMenuElement] = []
+
+        if let onToggleFavorite {
+            channelActions.append(
+                UIAction(
+                    title: isFavorite ? "Remove Favorite" : "Add to Favorites",
+                    image: UIImage(systemName: isFavorite ? "star.slash.fill" : "star")
+                ) { _ in onToggleFavorite() }
+            )
+        }
+        if canGoPrevious, let onPrevious {
+            channelActions.append(
+                UIAction(title: "Previous Channel", image: UIImage(systemName: "backward.end.fill")) { _ in onPrevious() }
+            )
+        }
+        if canGoNext, let onNext {
+            channelActions.append(
+                UIAction(title: "Next Channel", image: UIImage(systemName: "forward.end.fill")) { _ in onNext() }
+            )
+        }
+
+        var items: [UIMenuElement] = []
+        if !channelActions.isEmpty {
+            items.append(
+                UIMenu(
+                    title: "Channel",
+                    image: UIImage(systemName: "ellipsis.circle"),
+                    children: channelActions
+                )
+            )
+        }
+
+        // tvOS may collapse earlier custom items when the transport bar is
+        // crowded. Keep the complete volume menu last so its speaker button
+        // remains directly visible beside the Live timeline.
+        if onVolumeDown != nil || onToggleMute != nil || onVolumeUp != nil {
+            var volumeActions: [UIMenuElement] = []
+            if let onVolumeDown {
+                volumeActions.append(
+                    UIAction(title: "Volume Down", image: UIImage(systemName: "speaker.minus.fill")) { _ in onVolumeDown() }
+                )
+            }
+            if let onToggleMute {
+                volumeActions.append(
+                    UIAction(
+                        title: isMuted ? "Unmute" : "Mute",
+                        image: UIImage(systemName: isMuted ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                    ) { _ in onToggleMute() }
+                )
+            }
+            if let onVolumeUp {
+                volumeActions.append(
+                    UIAction(title: "Volume Up", image: UIImage(systemName: "speaker.plus.fill")) { _ in onVolumeUp() }
+                )
+            }
+
+            let percentage = Int((min(max(volume, 0), 1) * 100).rounded())
+            items.append(
+                UIMenu(
+                    title: "Volume \(percentage)%",
+                    image: UIImage(systemName: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill"),
+                    children: volumeActions
+                )
+            )
+        }
+        return items
+    }
+    #endif
 }
 
 private struct AirPlayRoutePicker: UIViewRepresentable {
@@ -4196,22 +4956,12 @@ private struct ChannelLogoView: View {
     @ViewBuilder
     private var imageContent: some View {
         if let urlString, let url = URL(string: urlString) {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case let .success(image):
-                    image
-                        .resizable()
-                        .scaledToFill()
-                case .failure:
-                    placeholder
-                case .empty:
-                    ZStack {
-                        placeholder
-                        ProgressView()
-                    }
-                @unknown default:
-                    placeholder
-                }
+            CachedAsyncImage(url: url, maxPixelSize: size * 2) { image in
+                image
+                    .resizable()
+                    .scaledToFill()
+            } placeholder: {
+                placeholder
             }
         } else {
             placeholder

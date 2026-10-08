@@ -181,6 +181,23 @@ enum IPTVDataStore {
         try context.save()
     }
 
+    /// Finds the stored channel for a given stream URL (used to toggle/read the
+    /// favorite state of whatever is currently playing).
+    static func channel(
+        profileID: UUID,
+        streamURL: String,
+        in context: NSManagedObjectContext
+    ) throws -> ChannelEntity? {
+        let request = ChannelEntity.fetchRequest()
+        request.predicate = NSPredicate(
+            format: "profileID == %@ AND streamURL == %@",
+            profileID as CVarArg,
+            streamURL
+        )
+        request.fetchLimit = 1
+        return try context.fetch(request).first
+    }
+
     static func setDownloadedState(
         for channel: ChannelEntity,
         isDownloaded: Bool,

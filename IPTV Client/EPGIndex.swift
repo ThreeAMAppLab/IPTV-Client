@@ -12,12 +12,28 @@ struct EPGIndex: Sendable {
     let channelIDsByNormalizedName: [String: Set<String>]
     let countriesByChannelID: [String: Set<String>]
 
-    static func build(from xmlData: Data) -> EPGIndex? {
-        let delegate = XMLTVIndexParserDelegate()
+    static func build(from xmlData: Data, onProgress: (@Sendable (Double) -> Void)? = nil) -> EPGIndex? {
+        let delegate = XMLTVIndexParserDelegate(
+            estimatedTotalProgrammes: estimateProgrammeCount(in: xmlData),
+            onProgress: onProgress
+        )
         let parser = XMLParser(data: xmlData)
         parser.delegate = delegate
         guard parser.parse() else { return nil }
         return delegate.makeIndex()
+    }
+
+    // A fast byte-level scan (not a real parse) used only to give progress
+    // reporting a rough denominator before the real parse below runs.
+    private static func estimateProgrammeCount(in xmlData: Data) -> Int {
+        guard let needle = "<programme".data(using: .utf8) else { return 0 }
+        var count = 0
+        var searchStart = xmlData.startIndex
+        while let range = xmlData.range(of: needle, in: searchStart..<xmlData.endIndex) {
+            count += 1
+            searchStart = range.upperBound
+        }
+        return count
     }
 
     func matches(keyword: String, channelID: String) -> Bool {
@@ -234,8 +250,11 @@ private enum TextNormalizer {
 }
 
 private final class XMLTVIndexParserDelegate: NSObject, XMLParserDelegate {
+    private static let maxSearchableTextLength = 20_000
+
     private var displayNamesByChannelID: [String: Set<String>] = [:]
-    private var searchableProgramTextByChannelID: [String: String] = [:]
+    private var searchableProgramChunksByChannelID: [String: [String]] = [:]
+    private var searchableProgramLengthByChannelID: [String: Int] = [:]
 
     private var currentChannelID: String?
     private var currentProgrammeChannelID: String?
@@ -243,6 +262,15 @@ private final class XMLTVIndexParserDelegate: NSObject, XMLParserDelegate {
     private var currentElementText = ""
     private var programmeTitleBuffer: [String] = []
     private var programmeDescriptionBuffer: [String] = []
+
+    private let estimatedTotalProgrammes: Int
+    private let onProgress: (@Sendable (Double) -> Void)?
+    private var processedProgrammeCount = 0
+
+    init(estimatedTotalProgrammes: Int, onProgress: (@Sendable (Double) -> Void)?) {
+        self.estimatedTotalProgrammes = estimatedTotalProgrammes
+        self.onProgress = onProgress
+    }
 
     func parser(
         _ parser: XMLParser,
@@ -299,6 +327,7 @@ private final class XMLTVIndexParserDelegate: NSObject, XMLParserDelegate {
         } else if elementName == "programme" {
             finalizeProgrammeEntry()
             currentProgrammeChannelID = nil
+            reportProgressIfNeeded()
         }
 
         if elementName == activeElement {
@@ -310,6 +339,13 @@ private final class XMLTVIndexParserDelegate: NSObject, XMLParserDelegate {
     func makeIndex() -> EPGIndex {
         var channelIDsByNormalizedName: [String: Set<String>] = [:]
         var countriesByChannelID: [String: Set<String>] = [:]
+
+        var searchableProgramTextByChannelID: [String: String] = [:]
+        searchableProgramTextByChannelID.reserveCapacity(searchableProgramChunksByChannelID.count)
+        for (channelID, chunks) in searchableProgramChunksByChannelID {
+            let joined = chunks.joined(separator: " ")
+            searchableProgramTextByChannelID[channelID] = String(joined.prefix(Self.maxSearchableTextLength))
+        }
 
         for (channelID, displayNames) in displayNamesByChannelID {
             for displayName in displayNames {
@@ -335,17 +371,28 @@ private final class XMLTVIndexParserDelegate: NSObject, XMLParserDelegate {
     private func finalizeProgrammeEntry() {
         guard let channelID = currentProgrammeChannelID else { return }
 
+        // Once a channel has accumulated enough searchable text, further
+        // programmes would just be discarded by the prefix cap in makeIndex()
+        // anyway, so skip the (otherwise wasted) parsing work for them.
+        guard searchableProgramLengthByChannelID[channelID, default: 0] < Self.maxSearchableTextLength else { return }
+
         let textParts = programmeTitleBuffer + programmeDescriptionBuffer
         guard !textParts.isEmpty else { return }
 
         let normalizedText = TextNormalizer.normalizeForSearch(textParts.joined(separator: " "))
         guard !normalizedText.isEmpty else { return }
 
-        if let existing = searchableProgramTextByChannelID[channelID] {
-            let merged = "\(existing) \(normalizedText)"
-            searchableProgramTextByChannelID[channelID] = String(merged.prefix(20_000))
-        } else {
-            searchableProgramTextByChannelID[channelID] = String(normalizedText.prefix(20_000))
-        }
+        searchableProgramChunksByChannelID[channelID, default: []].append(normalizedText)
+        searchableProgramLengthByChannelID[channelID, default: 0] += normalizedText.count + 1
+    }
+
+    private func reportProgressIfNeeded() {
+        guard let onProgress, estimatedTotalProgrammes > 0 else { return }
+        processedProgrammeCount += 1
+        // Throttle: reporting on every single programme would mean crossing
+        // back to the main actor tens of thousands of times for a large guide.
+        guard processedProgrammeCount % 50 == 0 else { return }
+        let fraction = min(Double(processedProgrammeCount) / Double(estimatedTotalProgrammes), 1)
+        onProgress(fraction)
     }
 }
